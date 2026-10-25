@@ -64,6 +64,16 @@ const ui_image_t *glyph(int which);
 // drawn over whatevers there, picked ones go dark oxblood like 9x washed them blue
 void icon_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y, int picked);
 
+// the drive pictures on the home page, 32px
+enum {
+    HOME_DRIVE,
+    HOME_USB,
+    HOME_MEMORY,
+    HOME_ICONS,
+};
+
+const ui_image_t *home_icon(int which);
+
 // view.c
 
 enum {
@@ -113,3 +123,33 @@ void view_rename_end(void);
 
 // remember where a file was put in the grid, so the folder looks the same next time
 void view_keep_spot(const char *path, int col, int row);
+
+// home.c, my computer: shortcuts and every mounted drive with how full it is
+
+#define HOME_PATH   "My Computer"
+
+// reads the drives again, keeps whatever was picked if its still there
+void home_open(void);
+void home_layout(ui_rect_t r);
+void home_draw(ui_canvas_t *c);
+
+int  home_count(void);
+int  home_picked(void);
+void home_pick(int i);
+void home_pick_path(const char *p);
+const char *home_path(int i);
+int  home_is_drive(int i);
+void home_space(int i, uint64_t *total, uint64_t *free);
+
+// same as view_at, -1 for empty space and -2 off the list
+int  home_at(int x, int y);
+int  home_mouse(int x, int y, int left, uint64_t now_ms);
+int  home_wheel(int notches);
+int  home_key(uint16_t keycode);
+
+// drives come and go and fill up, nonzero if it needs drawing again
+int  home_poll(void);
+
+// main.c
+
+void size_text(uint64_t size, char *out, size_t len);

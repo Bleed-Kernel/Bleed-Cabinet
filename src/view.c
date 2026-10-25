@@ -646,7 +646,7 @@ static ui_rect_t head_rect(int col) {
     return (ui_rect_t){ inner.x + name_w + SIZE_W, inner.y, TYPE_W, HEAD_H };
 }
 
-static void size_text(uint64_t size, char *out, size_t len) {
+static void kb_text(uint64_t size, char *out, size_t len) {
     snprintf(out, len, "%luKB", (unsigned long)((size + 1023) / 1024));
 }
 
@@ -694,7 +694,7 @@ static void details_draw(ui_canvas_t *c) {
         char text[48];
         if (e->kind != KIND_FOLDER && e->kind != KIND_DEVICE) {
             ui_rect_t s = head_rect(SORT_SIZE);
-            size_text(e->size, text, sizeof(text));
+            kb_text(e->size, text, sizeof(text));
             ui_text_in(c, &ui_font_text, (ui_rect_t){ s.x, r.y, s.w - 6, ROW_H }, text, UI_COLOUR_TEXT,
                        UI_ALIGN_RIGHT);
         }

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <syscalls.h>
 #include <keyboard.h>
@@ -23,6 +24,7 @@
 #define STATUS_H        22
 #define STATUS_RIGHT_W  150
 #define START_DIR       "/"
+#define HOME_POLL_MS    2000    // how often my computer looks at the drives again
 #define NEW_FOLDER      "New Folder"
 #define NEW_TEXT        "New Text Document"
 
@@ -71,6 +73,7 @@ static ui_rect_t     address_r, view_r, status_r;
 static int           grooves[2];
 static uint32_t      mouse_was;
 static int           quit;
+static int           at_home;
 
 static ui_menu_t     menu;
 static int           menu_acts[UI_MENU_ITEMS];
@@ -94,6 +97,10 @@ static uint64_t now_ms(void) {
     if (hpet_fd >= 0 && _ioctl(hpet_fd, HPET_IOCTL_GET_FEMTOSECONDS, &fs) == 0 && fs)
         return fs / femtosecondsPerMillisecond;
     return fallback += 10;
+}
+
+static const char *here(void) {
+    return at_home ? HOME_PATH : view_path();
 }
 
 static ui_canvas_t canvas(void) {
@@ -124,16 +131,20 @@ static void layout(void) {
     if (view_r.h < 0)
         view_r.h = 0;
     view_layout(view_r);
+    home_layout(view_r);
 }
 
-static void size_text(uint64_t size, char *out, size_t len) {
+void size_text(uint64_t size, char *out, size_t len) {
     if (size < 1024)
         snprintf(out, len, "%lu bytes", (unsigned long)size);
     else if (size < 1024 * 1024)
         snprintf(out, len, "%lu.%02luKB", (unsigned long)(size / 1024), (unsigned long)(size % 1024 * 100 / 1024));
-    else
+    else if (size < 1024ul * 1024 * 1024)
         snprintf(out, len, "%lu.%02luMB", (unsigned long)(size >> 20),
                  (unsigned long)((size & 0xFFFFF) * 100 >> 20));
+    else
+        snprintf(out, len, "%lu.%02luGB", (unsigned long)(size >> 30),
+                 (unsigned long)((size & 0x3FFFFFFF) * 100 >> 30));
 }
 
 static void status_draw(ui_canvas_t *c) {
@@ -147,6 +158,21 @@ static void status_draw(ui_canvas_t *c) {
 
     if (hint >= 0) {
         snprintf(left, sizeof(left), "%s", btn_hint[hint]);
+    } else if (at_home) {
+        int h = home_picked();
+        snprintf(right, sizeof(right), HOME_PATH);
+        if (home_is_drive(h)) {
+            uint64_t total, free;
+            char     f[24], t[24];
+            home_space(h, &total, &free);
+            size_text(free, f, sizeof(f));
+            size_text(total, t, sizeof(t));
+            snprintf(left, sizeof(left), "Free Space: %s, Capacity: %s", f, t);
+        } else if (h >= 0) {
+            snprintf(left, sizeof(left), "1 object(s) selected");
+        } else {
+            snprintf(left, sizeof(left), "%d object(s)", home_count());
+        }
     } else if (i >= 0) {
         const entry_t *e = view_entry(i);
         snprintf(left, sizeof(left), "1 object(s) selected");
@@ -175,7 +201,7 @@ static void address_draw(ui_canvas_t *c) {
     ui_panel(c, address_r, UI_SUNKEN);
 
     char text[CAB_PATH_MAX];
-    ui_text_ascii(text, sizeof(text), typing ? typed : view_path());
+    ui_text_ascii(text, sizeof(text), typing ? typed : here());
 
     ui_rect_t inside = ui_rect_shrink(address_r, 2);
     ui_rect_t old    = c->clip;
@@ -197,8 +223,9 @@ static void draw_all(void) {
 
     buttons[BTN_BACK].disabled    = !back_count;
     buttons[BTN_FORWARD].disabled = !forward_count;
-    buttons[BTN_UP].disabled      = !strcmp(view_path(), "/");
-    buttons[BTN_DELETE].disabled  = view_picked() < 0;
+    buttons[BTN_UP].disabled      = at_home;
+    buttons[BTN_NEW].disabled     = at_home;
+    buttons[BTN_DELETE].disabled  = at_home || view_picked() < 0;
     for (int i = 0; i < BTN_COUNT; i++)
         ui_button_draw(&c, &buttons[i]);
     for (int g = 0; g < 2; g++) {
@@ -208,7 +235,10 @@ static void draw_all(void) {
     ui_separator(&c, 0, TOOL_H, win->width);
 
     address_draw(&c);
-    view_draw(&c);
+    if (at_home)
+        home_draw(&c);
+    else
+        view_draw(&c);
     status_draw(&c);
 
     // these go over everything else
@@ -218,7 +248,7 @@ static void draw_all(void) {
 }
 
 static void title_update(void) {
-    const char *p    = view_path();
+    const char *p    = here();
     const char *base = strrchr(p, '/');
     char        title[CS_TITLE_MAX];
 
@@ -236,15 +266,20 @@ static void push(char (*stack)[CAB_PATH_MAX], int *count, const char *p) {
 
 static int go_to(const char *p, int how) {
     char from[CAB_PATH_MAX];
-    strcpy(from, view_path());
+    strcpy(from, here());
 
-    if (view_open(p) < 0) {
+    if (!strcasecmp(p, HOME_PATH)) {
+        home_open();
+        at_home = 1;
+    } else if (view_open(p) == 0) {
+        at_home = 0;
+    } else {
         char text[CAB_PATH_MAX + 64];
         snprintf(text, sizeof(text), "Cabinet cant open '%s'.\nMake sure the folder is there and try again.", p);
         ui_message("Cabinet", text, UI_ICON_ERROR);
         return -1;
     }
-    if (strcmp(from, view_path())) {
+    if (strcmp(from, here())) {
         if (how == GO_BACK) {
             push(forward, &forward_count, from);
         } else {
@@ -269,10 +304,14 @@ static void go_history(int how) {
         return;
 
     char from[CAB_PATH_MAX], to[CAB_PATH_MAX];
-    strcpy(from, view_path());
+    strcpy(from, here());
     strcpy(to, stack[--(*count)]);
     if (go_to(to, how) < 0)
         return;
+    if (at_home) {
+        home_pick_path(from);
+        return;
+    }
 
     size_t len = strlen(to);
     if (!strncmp(from, to, len) && (from[len] == '/' || len == 1)) {
@@ -286,12 +325,18 @@ static void go_history(int how) {
     }
 }
 
-// the folder above, with the one we came out of picked
+// the folder above, with the one we came out of picked. above / is my computer
 static void go_up(void) {
+    if (at_home)
+        return;
+
     char p[CAB_PATH_MAX];
     strcpy(p, view_path());
-    if (!strcmp(p, "/"))
+    if (!strcmp(p, "/")) {
+        if (go(HOME_PATH) == 0)
+            home_pick_path(p);
         return;
+    }
 
     char  child[CAB_NAME_MAX];
     char *slash = strrchr(p, '/');
@@ -323,6 +368,12 @@ static void run(const char *program, const char *file) {
 }
 
 static void open_picked(void) {
+    if (at_home) {
+        if (home_picked() >= 0)
+            go(home_path(home_picked()));
+        return;
+    }
+
     int i = view_picked();
     if (i < 0)
         return;
@@ -517,12 +568,19 @@ static void handle(int r) {
         draw_all();
 }
 
+static void refresh(void) {
+    if (at_home)
+        home_open();
+    else
+        view_refresh();
+}
+
 static void button_clicked(int i) {
     switch (i) {
     case BTN_BACK:    go_history(GO_BACK); break;
     case BTN_FORWARD: go_history(GO_FORWARD); break;
     case BTN_UP:      go_up(); break;
-    case BTN_REFRESH: view_refresh(); break;
+    case BTN_REFRESH: refresh(); break;
     case BTN_NEW:     new_folder(); break;
     case BTN_DELETE:  delete_picked(); break;
     }
@@ -534,8 +592,29 @@ static void menu_add(const char *label, int act) {
     menu_acts[menu.count++]   = act;
 }
 
+static void home_menu(int x, int y) {
+    int hit = home_at(x, y);
+    if (hit == -2)
+        return;
+    home_pick(hit);
+
+    menu.count = 0;
+    if (hit >= 0) {
+        menu_add("Open", ACT_OPEN);
+        menu_add("Open Terminal Here", ACT_TERMINAL_IN);
+    } else {
+        menu_add("Refresh", ACT_REFRESH);
+    }
+    ui_menu_open(&menu, x, y, (ui_rect_t){ 0, 0, win->width, win->height });
+}
+
 // on something its what you can do to it, on empty space its what you can make here
 static void menu_show(int x, int y) {
+    if (at_home) {
+        home_menu(x, y);
+        return;
+    }
+
     int hit = view_at(x, y);
     if (hit == -2)
         return;
@@ -571,14 +650,16 @@ static void menu_do(int act) {
     case ACT_DELETE:     delete_picked(); break;
     case ACT_NEW_FOLDER: new_folder(); break;
     case ACT_NEW_TEXT:   new_text(); break;
-    case ACT_REFRESH:    view_refresh(); break;
+    case ACT_REFRESH:    refresh(); break;
     case ACT_HIDDEN:
         view_show_hidden(!view_hidden_shown());
         view_refresh();
         break;
     case ACT_TERMINAL:   terminal_at(view_path()); break;
     case ACT_TERMINAL_IN:
-        if (view_picked() >= 0) {
+        if (at_home && home_picked() >= 0) {
+            terminal_at(home_path(home_picked()));
+        } else if (!at_home && view_picked() >= 0) {
             view_entry_path(view_picked(), full, sizeof(full));
             terminal_at(full);
         }
@@ -662,14 +743,14 @@ static void on_mouse(const cs_event_t *ev) {
         int in_address = ui_rect_contains(address_r, ev->x, ev->y);
         if (in_address && !typing) {
             typing = 1;
-            strcpy(typed, view_path());
+            strcpy(typed, here());
             draw_all();
         } else if (!in_address && typing) {
             typing = 0;
             draw_all();
         }
     }
-    handle(view_mouse(ev->x, ev->y, left, now_ms()));
+    handle(at_home ? home_mouse(ev->x, ev->y, left, now_ms()) : view_mouse(ev->x, ev->y, left, now_ms()));
 }
 
 static void on_key(const cs_event_t *ev) {
@@ -700,7 +781,7 @@ static void on_key(const cs_event_t *ev) {
         draw_all();
         return;
     }
-    handle(view_key(ev->keycode, ch));
+    handle(at_home ? home_key(ev->keycode) : view_key(ev->keycode, ch));
 }
 
 static void on_event(const cs_event_t *ev) {
@@ -716,7 +797,7 @@ static void on_event(const cs_event_t *ev) {
         on_mouse(ev);
         break;
     case CS_EV_WHEEL:
-        handle(view_wheel(ev->wheel));
+        handle(at_home ? home_wheel(ev->wheel) : view_wheel(ev->wheel));
         break;
     case CS_EV_KEY:
         on_key(ev);
@@ -747,16 +828,20 @@ int main(int argc, char **argv) {
     }
 
     layout();
-    if (view_open(argc > 1 ? argv[1] : START_DIR) < 0)
-        view_open(START_DIR);
+    if (argc < 2 || view_open(argv[1]) < 0) {
+        home_open();
+        at_home = 1;
+    }
     layout();
     title_update();
     draw_all();
 
     cs_event_t ev;
     while (!quit) {
-        if (cs_event_wait(&ev, -1) > 0)
+        if (cs_event_wait(&ev, at_home ? HOME_POLL_MS : -1) > 0)
             on_event(&ev);
+        else if (at_home && !menu.open && home_poll())
+            draw_all();
     }
 
     cs_window_close(win);

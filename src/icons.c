@@ -21,12 +21,14 @@ static const int sizes[] = { 48, 32, 16 };
 
 static ui_image_t kinds[KINDS][2];  // big then small
 static ui_image_t glyphs[GLYPHS];
+static ui_image_t homes[HOME_ICONS];
 static cached_t   cache[CACHE_MAX];
 static int        cached;
 
 // cabinets own pictures are pngs in res/icons, built into the binary as .bleed.cab.<file name>
 static const char *kind_files[KINDS] = { "folder", "program", "text", "audio", "image", "file", "device" };
 static const char *glyph_files[GLYPHS] = { "back", "forward", "up", "refresh", "newfolder", "delete" };
+static const char *home_files[HOME_ICONS] = { "drive", "usb", "memory" };
 
 static char self[CAB_PATH_MAX];
 
@@ -118,6 +120,10 @@ const ui_image_t *glyph(int which) {
     return which >= 0 && which < GLYPHS ? &glyphs[which] : NULL;
 }
 
+const ui_image_t *home_icon(int which) {
+    return which >= 0 && which < HOME_ICONS ? &homes[which] : NULL;
+}
+
 void icons_init(void) {
     task_path((uint64_t)_getpid(), self, sizeof(self));
     for (int k = 0; k < KINDS; k++)
@@ -127,6 +133,10 @@ void icons_init(void) {
     for (int g = 0; g < GLYPHS; g++) {
         snprintf(name, sizeof(name), "tool-%s", glyph_files[g]);
         own_load(name, &glyphs[g]);
+    }
+    for (int h = 0; h < HOME_ICONS; h++) {
+        if (own_load(home_files[h], &homes[h]) == 0)
+            fit(&homes[h], ICON_BIG);
     }
 }
 
