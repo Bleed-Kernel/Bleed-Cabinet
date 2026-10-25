@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <syscalls.h>
 #include <keyboard.h>
+#include <crime/crime.h>
 #include <cabinet.h>
 
 #define CELL_W          76
@@ -69,6 +70,7 @@ static int       sort_key;
 static int       sort_back;
 
 static int       editing;
+static int       show_hidden;
 static int       edit_fresh;        // the whole name is picked out, the first key replaces it
 static char      edit[CAB_NAME_MAX];
 
@@ -411,6 +413,8 @@ int view_open(const char *want) {
         entry.name[sizeof(entry.name) - 1] = '\0';
         if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..") || !entry.name[0])
             continue;
+        if (!show_hidden && cs_name_hidden(entry.name))
+            continue;
 
         if (count == cap) {
             int      grow = cap ? cap * 2 : 64;
@@ -463,6 +467,14 @@ void view_refresh(void) {
 
 const char *view_path(void) {
     return path;
+}
+
+void view_show_hidden(int on) {
+    show_hidden = on;
+}
+
+int view_hidden_shown(void) {
+    return show_hidden;
 }
 
 void view_layout(ui_rect_t r) {

@@ -54,6 +54,7 @@ enum {
     ACT_NEW_FOLDER,
     ACT_NEW_TEXT,
     ACT_REFRESH,
+    ACT_HIDDEN,
     ACT_LINE,
 };
 
@@ -471,11 +472,21 @@ static void rename_done(void) {
     if (!name[0] || !strcmp(name, e->name))
         return;
 
-    char text[CAB_NAME_MAX + 96];
+    char text[CAB_NAME_MAX + 256];
     if (name_taken(name)) {
         snprintf(text, sizeof(text), "Cannot rename '%s': a file with the name you specified already exists.", e->name);
         ui_message("Error Renaming File", text, UI_ICON_ERROR);
         return;
+    }
+
+    if (cs_name_hidden(name) && !cs_name_hidden(e->name)) {
+        snprintf(text, sizeof(text),
+                 "'%s' is a hidden name, so it will be hidden from view%s.\n\n"
+                 "Names starting with a dot, and a few others like lost+found, are left out. "
+                 "Right click and pick Show Hidden Files to see them.\n\nUse this name anyway?",
+                 name, view_hidden_shown() ? " once Show Hidden Files is off" : "");
+        if (!ui_ask("Hidden Name", text))
+            return;
     }
 
     char from[CAB_PATH_MAX], to[CAB_PATH_MAX];
@@ -546,6 +557,7 @@ static void menu_show(int x, int y) {
         menu_add(NULL, ACT_LINE);
         menu_add("Open Terminal Here", ACT_TERMINAL);
         menu_add(NULL, ACT_LINE);
+        menu_add(view_hidden_shown() ? "Hide Hidden Files" : "Show Hidden Files", ACT_HIDDEN);
         menu_add("Refresh", ACT_REFRESH);
     }
     ui_menu_open(&menu, x, y, (ui_rect_t){ 0, 0, win->width, win->height });
@@ -560,6 +572,10 @@ static void menu_do(int act) {
     case ACT_NEW_FOLDER: new_folder(); break;
     case ACT_NEW_TEXT:   new_text(); break;
     case ACT_REFRESH:    view_refresh(); break;
+    case ACT_HIDDEN:
+        view_show_hidden(!view_hidden_shown());
+        view_refresh();
+        break;
     case ACT_TERMINAL:   terminal_at(view_path()); break;
     case ACT_TERMINAL_IN:
         if (view_picked() >= 0) {

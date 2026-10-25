@@ -80,6 +80,9 @@ enum {
 
 // reads path in, -1 if its not a folder that can be read and nothing changes
 int  view_open(const char *path);
+
+void view_show_hidden(int on);
+int  view_hidden_shown(void);
 void view_refresh(void);
 const char *view_path(void);
 
