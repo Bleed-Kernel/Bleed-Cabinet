@@ -21,6 +21,7 @@
 #define DRAG_START      4       // how far it has to move before its a drag and not a click
 #define DOUBLE_CLICK_MS 400
 #define WHEEL_ROWS      3
+#define EDGE_SCROLL     12
 #define SPOTS_MAX       1024
 #define DIR_TYPE        0       // INODE_DIRECTORY
 #define DEVICE_TYPE     2       // and INODE_DEVICE
@@ -57,11 +58,19 @@ static int       cols   = 1;
 static ui_rect_t frame, inner;
 static ui_scrollbar_t bar;
 
+// drags and boxes are kept from the top left of the content
 static int       held = -1;
 static int       moved;
-static int       grab_x, grab_y;
+static int       let_go;
 static int       from_x, from_y;
-static int       drag_x, drag_y;    // where the held ones cell is, from the top left of the grid
+static int       at_x, at_y;
+static int       ptr_x, ptr_y;
+static int       target = -1;
+static int       dropped_on = -1;
+static int       anchor = -1;       // shift picks everything from here
+static int       banding;           // a box being dragged out over empty space
+static int       band_x, band_y;
+static uint64_t  signature;         // of the listing, to see when it changes
 static int       last_click = -1;
 static uint64_t  last_click_ms;
 static uint8_t   was_left;
@@ -159,7 +168,7 @@ static int kind_of(const char *full, const char *name, uint64_t *size) {
 }
 
 // the type column, the way 9x wrote it
-static void kind_name(const entry_t *e, char *out, size_t size) {
+void kind_name(const entry_t *e, char *out, size_t size) {
     char        ext[16] = "";
     const char *dot     = extension(e->name);
     for (int i = 0; dot && dot[i] && i < (int)sizeof(ext) - 1; i++) {
@@ -202,13 +211,20 @@ static void sort_all(void) {
     qsort(items, count, sizeof(entry_t), compare);
 }
 
+static int find(const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (!strcmp(items[i].name, name))
+            return i;
+    }
+    return -1;
+}
+
 static void sort_items(void) {
     char name[CAB_NAME_MAX] = "";
     if (picked >= 0)
         strcpy(name, items[picked].name);
     sort_all();
-    if (name[0])
-        view_pick_name(name);
+    picked = anchor = name[0] ? find(name) : -1;
 }
 
 // spots
@@ -326,6 +342,14 @@ static int list_top(void) {
     return inner.y + HEAD_H;
 }
 
+static int origin_x(void) {
+    return mode == VIEW_ICONS ? grid_x() : inner.x;
+}
+
+static int origin_y(void) {
+    return mode == VIEW_ICONS ? grid_y() : list_top() - bar.top * ROW_H;
+}
+
 static ui_rect_t row_rect(int i) {
     return (ui_rect_t){ inner.x, list_top() + (i - bar.top) * ROW_H, inner.w, ROW_H };
 }
@@ -353,36 +377,75 @@ static void show(int i) {
         ui_scrollbar_to(&bar, at - bar.visible + 1);
 }
 
-// the one dropped goes to the closest cell nothing else is in
-static void snap(int i) {
+// the dragged ones go to the closest cells nothing else is in
+static void snap_chosen(void) {
     int      rows = grid_rows();
     uint8_t *used = calloc((size_t)cols * rows, 1);
-    if (!used)
+    int     *want = calloc((size_t)count * 2, sizeof(int));
+    if (!used || !want) {
+        free(used);
+        free(want);
         return;
+    }
     for (int j = 0; j < count; j++) {
-        if (j != i && items[j].col < cols && items[j].row < rows)
+        if (!items[j].chosen && items[j].col < cols && items[j].row < rows)
             used[items[j].row * cols + items[j].col] = 1;
+        want[j * 2]     = items[j].col * CELL_W + at_x - from_x;
+        want[j * 2 + 1] = items[j].row * CELL_H + at_y - from_y;
     }
-
-    long best = -1;
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            if (used[r * cols + c])
-                continue;
-            long dx = c * CELL_W - drag_x, dy = r * CELL_H - drag_y;
-            if (best < 0 || dx * dx + dy * dy < best) {
-                best         = dx * dx + dy * dy;
-                items[i].col = c;
-                items[i].row = r;
-            }
-        }
-    }
-    free(used);
 
     char full[CAB_PATH_MAX];
-    join(path, items[i].name, full, sizeof(full));
-    view_keep_spot(full, items[i].col, items[i].row);
+    for (int i = 0; i < count; i++) {
+        if (!items[i].chosen)
+            continue;
+        long best = -1;
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                if (used[r * cols + c])
+                    continue;
+                long dx = c * CELL_W - want[i * 2], dy = r * CELL_H - want[i * 2 + 1];
+                if (best < 0 || dx * dx + dy * dy < best) {
+                    best         = dx * dx + dy * dy;
+                    items[i].col = c;
+                    items[i].row = r;
+                }
+            }
+        }
+        if (best >= 0)
+            used[items[i].row * cols + items[i].col] = 1;
+        join(path, items[i].name, full, sizeof(full));
+        view_keep_spot(full, items[i].col, items[i].row);
+    }
+    free(used);
+    free(want);
     bar_update();
+}
+
+void view_line_up(void) {
+    for (int i = 0; i < count; i++) {
+        items[i].col = i % cols;
+        items[i].row = i / cols;
+    }
+    keep_all();
+    bar_update();
+    show(picked);
+}
+
+static uint64_t listing_signature(const char *p) {
+    int fd = _open(p, O_RDONLY);
+    if (fd < 0)
+        return 0;
+
+    uint64_t h = 14695981039346656037ull;
+    dirent_t entry;
+    for (size_t i = 0; _readdir(fd, i, &entry) == 0; i++) {
+        entry.name[sizeof(entry.name) - 1] = '\0';
+        for (const char *c = entry.name; *c; c++)
+            h = (h ^ (uint8_t)*c) * 1099511628211ull;
+        h = (h ^ (uint64_t)(entry.type + 1)) * 1099511628211ull;
+    }
+    _close(fd);
+    return h;
 }
 
 // listing
@@ -404,7 +467,10 @@ int view_open(const char *want) {
     keep_all();
     count   = 0;
     picked  = -1;
+    anchor  = -1;
     held    = -1;
+    target  = -1;
+    banding = 0;
     editing = 0;
     strcpy(path, clean);
 
@@ -447,9 +513,12 @@ int view_open(const char *want) {
     bar.top = 0;
     place();
     bar_update();
+    view_mark_cut();
+    signature = listing_signature(path);
     return 0;
 }
 
+// whats chosen stays chosen if its still there
 void view_refresh(void) {
     char name[CAB_NAME_MAX] = "";
     char here[CAB_PATH_MAX];
@@ -457,12 +526,50 @@ void view_refresh(void) {
         strcpy(name, items[picked].name);
     strcpy(here, path);
 
+    int    n = 0;
+    char **chosen = malloc((size_t)(count ? count : 1) * sizeof(char *));
+    for (int i = 0; chosen && i < count; i++) {
+        if (items[i].chosen && (chosen[n] = strdup(items[i].name)))
+            n++;
+    }
+
     int top = bar.top;
-    if (view_open(here) < 0)
-        return;
-    ui_scrollbar_to(&bar, top);
-    if (name[0])
-        view_pick_name(name);
+    if (view_open(here) == 0) {
+        ui_scrollbar_to(&bar, top);
+        for (int i = 0; i < n; i++) {
+            int at = find(chosen[i]);
+            if (at >= 0)
+                items[at].chosen = 1;
+        }
+        picked = anchor = name[0] ? find(name) : -1;
+    }
+    if (chosen)
+        list_free(chosen, n);
+}
+
+int view_poll(void) {
+    if (held >= 0 || banding || editing)
+        return 0;
+    uint64_t now = listing_signature(path);
+    if (now == signature)
+        return 0;
+    signature = now;
+    view_refresh();
+    return VIEW_REDRAW | VIEW_STATUS;
+}
+
+void view_mark_cut(void) {
+    int    n, cut;
+    char **clip = clip_get(&n, &cut);
+    char   full[CAB_PATH_MAX];
+    for (int i = 0; i < count; i++) {
+        items[i].cut = 0;
+        join(path, items[i].name, full, sizeof(full));
+        for (int j = 0; cut && j < n && !items[i].cut; j++)
+            items[i].cut = !strcmp(clip[j], full);
+    }
+    if (clip)
+        list_free(clip, n);
 }
 
 const char *view_path(void) {
@@ -512,14 +619,48 @@ int view_picked(void) {
     return picked;
 }
 
-void view_pick_name(const char *name) {
-    for (int i = 0; i < count; i++) {
-        if (!strcmp(items[i].name, name)) {
-            picked = i;
-            show(i);
-            return;
-        }
+int view_chosen_count(void) {
+    int n = 0;
+    for (int i = 0; i < count; i++)
+        n += items[i].chosen;
+    return n;
+}
+
+char **view_chosen_paths(int *n) {
+    *n = 0;
+    char **paths = malloc((size_t)(count ? count : 1) * sizeof(char *));
+    char   full[CAB_PATH_MAX];
+    for (int i = 0; paths && i < count; i++) {
+        if (!items[i].chosen)
+            continue;
+        join(path, items[i].name, full, sizeof(full));
+        if ((paths[*n] = strdup(full)))
+            (*n)++;
     }
+    return paths;
+}
+
+void view_choose_name(const char *name) {
+    int i = find(name);
+    if (i < 0)
+        return;
+    items[i].chosen = 1;
+    if (picked < 0)
+        picked = anchor = i;
+    show(i);
+}
+
+int view_dragging(void) {
+    return held >= 0 && moved;
+}
+
+int view_drop_target(void) {
+    return held >= 0 ? target : dropped_on;
+}
+
+void view_drop_point(int *x, int *y) {
+    *x = ptr_x;
+    *y = ptr_y;
 }
 
 void view_entry_path(int i, char *out, size_t size) {
@@ -595,15 +736,23 @@ static void edit_draw(ui_canvas_t *c, ui_rect_t r) {
     c->clip = old;
 }
 
-static void cell_draw(ui_canvas_t *c, int i, int x, int y) {
+static int look_of(int i, int ghost) {
+    if (ghost || items[i].cut)
+        return LOOK_GHOST;
+    return items[i].chosen || i == target ? LOOK_PICKED : LOOK_PLAIN;
+}
+
+// ghost is the copy that follows the pointer about
+static void cell_draw(ui_canvas_t *c, int i, int x, int y, int ghost) {
     const entry_t *e  = &items[i];
-    int            on = i == picked;
+    int            on = !ghost && (e->chosen || i == target);
 
     if (e->big)
-        icon_draw(c, e->big, x + (CELL_W - e->big->w) / 2, y + ICON_TOP + (ICON_BIG - e->big->h) / 2, on);
+        icon_draw(c, e->big, x + (CELL_W - e->big->w) / 2, y + ICON_TOP + (ICON_BIG - e->big->h) / 2,
+                  look_of(i, ghost));
 
     int lh = ui_font_height(&ui_font_text);
-    if (on && editing) {
+    if (!ghost && i == picked && editing) {
         int w = ui_text_width(&ui_font_text, edit) + 10;
         if (w < CELL_W - 8)
             w = CELL_W - 8;
@@ -621,22 +770,17 @@ static void cell_draw(ui_canvas_t *c, int i, int x, int y) {
         int ty = y + LABEL_TOP + l * lh;
         if (on)
             ui_fill(c, (ui_rect_t){ tx - LABEL_PAD, ty, tw + LABEL_PAD * 2, lh }, UI_COLOUR_CAPTION_R);
-        ui_text(c, &ui_font_text, tx, ty, lines[l], UI_COLOUR_TEXT);
+        ui_text(c, &ui_font_text, tx, ty, lines[l], ghost ? UI_COLOUR_BACK_TEXT : UI_COLOUR_TEXT);
     }
 }
 
 static void icons_draw(ui_canvas_t *c) {
     for (int i = 0; i < count; i++) {
-        if (i == held && moved)
-            continue;
         ui_rect_t r = cell_rect(i);
         if (r.y + r.h < inner.y || r.y > inner.y + inner.h)
             continue;
-        cell_draw(c, i, r.x, r.y);
+        cell_draw(c, i, r.x, r.y, 0);
     }
-    // the one being dragged goes over the rest
-    if (held >= 0 && moved)
-        cell_draw(c, held, grid_x() + drag_x, grid_y() + drag_y);
 }
 
 static ui_rect_t head_rect(int col) {
@@ -668,14 +812,14 @@ static void details_draw(ui_canvas_t *c) {
     for (int i = bar.top; i < count && i < bar.top + bar.visible + 1; i++) {
         const entry_t *e  = &items[i];
         ui_rect_t      r  = row_rect(i);
-        int            on = i == picked;
+        int            on = e->chosen || i == target;
 
         if (e->small)
-            icon_draw(c, e->small, r.x + 4, r.y + (ROW_H - e->small->h) / 2, on);
+            icon_draw(c, e->small, r.x + 4, r.y + (ROW_H - e->small->h) / 2, look_of(i, 0));
 
         ui_rect_t name = head_rect(SORT_NAME);
         name = (ui_rect_t){ r.x + 24, r.y, name.w - 28, ROW_H };
-        if (on && editing) {
+        if (i == picked && editing) {
             edit_draw(c, (ui_rect_t){ name.x - 2, r.y, name.w, ROW_H });
         } else {
             char text[CAB_NAME_MAX];
@@ -706,6 +850,46 @@ static void details_draw(ui_canvas_t *c) {
     c->clip = old;
 }
 
+// see through copies of whats chosen following the pointer
+static void drag_draw(ui_canvas_t *c) {
+    int dx = at_x - from_x, dy = at_y - from_y;
+    for (int i = 0; i < count; i++) {
+        if (!items[i].chosen)
+            continue;
+        if (mode == VIEW_ICONS) {
+            ui_rect_t r = cell_rect(i);
+            cell_draw(c, i, r.x + dx, r.y + dy, 1);
+            continue;
+        }
+        ui_rect_t r = row_rect(i);
+        if (r.y + dy + ROW_H < inner.y || r.y + dy > inner.y + inner.h)
+            continue;
+        char text[CAB_NAME_MAX];
+        ui_text_ascii(text, sizeof(text), items[i].name);
+        if (items[i].small)
+            icon_draw(c, items[i].small, r.x + 4 + dx, r.y + dy + (ROW_H - items[i].small->h) / 2, LOOK_GHOST);
+        ui_text_in(c, &ui_font_text, (ui_rect_t){ r.x + 24 + dx, r.y + dy, head_rect(SORT_NAME).w - 28, ROW_H },
+                   text, UI_COLOUR_BACK_TEXT, UI_ALIGN_LEFT);
+    }
+}
+
+// a dotted outline like 9x
+static void band_draw(ui_canvas_t *c) {
+    int x0 = band_x + origin_x(), y0 = band_y + origin_y();
+    int x1 = ptr_x, y1 = ptr_y;
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+
+    for (int x = x0; x <= x1; x += 2) {
+        ui_fill(c, (ui_rect_t){ x, y0, 1, 1 }, UI_COLOUR_TEXT);
+        ui_fill(c, (ui_rect_t){ x, y1, 1, 1 }, UI_COLOUR_TEXT);
+    }
+    for (int y = y0; y <= y1; y += 2) {
+        ui_fill(c, (ui_rect_t){ x0, y, 1, 1 }, UI_COLOUR_TEXT);
+        ui_fill(c, (ui_rect_t){ x1, y, 1, 1 }, UI_COLOUR_TEXT);
+    }
+}
+
 void view_draw(ui_canvas_t *c) {
     ui_panel(c, frame, UI_SUNKEN);
     ui_fill(c, inner, COLOUR_VIEW);
@@ -716,6 +900,10 @@ void view_draw(ui_canvas_t *c) {
         icons_draw(c);
     else
         details_draw(c);
+    if (held >= 0 && moved)
+        drag_draw(c);
+    if (banding)
+        band_draw(c);
     c->clip = old;
 
     if (bar.total > bar.visible)
@@ -744,9 +932,32 @@ static int item_at(int x, int y) {
     return -1;
 }
 
+static void unchoose(void) {
+    for (int i = 0; i < count; i++)
+        items[i].chosen = 0;
+}
+
+// only i chosen, and the focus on it
 static int pick(int i) {
-    if (i == picked)
+    int same = i == picked && view_chosen_count() == (i >= 0) && (i < 0 || items[i].chosen);
+    unchoose();
+    if (i >= 0)
+        items[i].chosen = 1;
+    picked = anchor = i;
+    show(i);
+    return same ? 0 : VIEW_REDRAW | VIEW_STATUS;
+}
+
+// shift: everything from the anchor to i the way theyre listed
+static int extend(int i) {
+    if (i < 0)
         return 0;
+    if (anchor < 0 || anchor >= count)
+        anchor = i;
+    unchoose();
+    int lo = anchor < i ? anchor : i, hi = anchor < i ? i : anchor;
+    for (int j = lo; j <= hi; j++)
+        items[j].chosen = 1;
     picked = i;
     show(i);
     return VIEW_REDRAW | VIEW_STATUS;
@@ -754,6 +965,24 @@ static int pick(int i) {
 
 void view_pick(int i) {
     pick(i >= 0 && i < count ? i : -1);
+}
+
+void view_pick_name(const char *name) {
+    int i = find(name);
+    if (i >= 0)
+        pick(i);
+}
+
+void view_focus(int i) {
+    if (i >= 0 && i < count)
+        picked = anchor = i;
+}
+
+void view_pick_all(void) {
+    for (int i = 0; i < count; i++)
+        items[i].chosen = 1;
+    if (picked < 0 && count)
+        picked = anchor = 0;
 }
 
 int view_at(int x, int y) {
@@ -764,36 +993,164 @@ int view_at(int x, int y) {
     return item_at(x, y);
 }
 
-int view_mouse(int x, int y, int left, uint64_t now_ms) {
+// folders take files, programs open them
+static int drop_target(int x, int y) {
+    if (view_at(x, y) < 0)
+        return -1;
+    int i = item_at(x, y);
+    if (i < 0 || items[i].chosen)
+        return -1;
+    return items[i].kind == KIND_FOLDER || items[i].kind == KIND_PROGRAM ? i : -1;
+}
+
+// held near the top or bottom the view scrolls that way
+static void edge_scroll(int y) {
+    int top = mode == VIEW_ICONS ? inner.y : list_top();
+    if (y < top + EDGE_SCROLL)
+        ui_scrollbar_to(&bar, bar.top - 1);
+    else if (y >= inner.y + inner.h - EDGE_SCROLL)
+        ui_scrollbar_to(&bar, bar.top + 1);
+}
+
+// what counts as being in the box, from the top left of the content
+static ui_rect_t box_rect(int i) {
+    if (mode == VIEW_ICONS)
+        return (ui_rect_t){ items[i].col * CELL_W + 6, items[i].row * CELL_H + ICON_TOP, CELL_W - 12,
+                            CELL_H - ICON_TOP - 4 };
+    return (ui_rect_t){ 0, i * ROW_H, head_rect(SORT_NAME).w, ROW_H };
+}
+
+static void choose_band(void) {
+    int x0 = band_x, y0 = band_y;
+    int x1 = ptr_x - origin_x(), y1 = ptr_y - origin_y();
+    ui_rect_t box = { x0 < x1 ? x0 : x1, y0 < y1 ? y0 : y1, (x0 < x1 ? x1 - x0 : x0 - x1) + 1,
+                      (y0 < y1 ? y1 - y0 : y0 - y1) + 1 };
+
+    picked = -1;
+    for (int i = 0; i < count; i++) {
+        ui_rect_t r  = box_rect(i);
+        int       in = r.x < box.x + box.w && box.x < r.x + r.w && r.y < box.y + box.h && box.y < r.y + r.h;
+        items[i].chosen = in || items[i].kept;
+        if (in && picked < 0)
+            picked = i;
+    }
+    anchor = picked;
+}
+
+static int let_go_of(int x, int y) {
+    int r = VIEW_REDRAW | VIEW_STATUS;
+    ptr_x = x;
+    ptr_y = y;
+    dropped_on = -1;
+    if (moved) {
+        if (!ui_rect_contains(inner, x, y)) {
+            r |= VIEW_DROP_OUT;
+        } else if (target >= 0) {
+            dropped_on = target;
+            r |= VIEW_DROP;
+        } else if (mode == VIEW_ICONS) {
+            snap_chosen();
+        }
+    } else if (let_go) {
+        pick(held);
+    }
+    held   = -1;
+    moved  = 0;
+    let_go = 0;
+    target = -1;
+    return r;
+}
+
+static int press_on(int i, int x, int y, uint8_t keymod, uint64_t now_ms) {
+    int r = VIEW_REDRAW | VIEW_STATUS;
+
+    // empty space starts a box, ctrl keeps what was chosen already
+    if (i < 0) {
+        if (!(keymod & KEYMOD_CTRL)) {
+            unchoose();
+            picked = anchor = -1;
+        }
+        for (int j = 0; j < count; j++)
+            items[j].kept = items[j].chosen;
+        banding    = 1;
+        band_x     = x - origin_x();
+        band_y     = y - origin_y();
+        ptr_x      = x;
+        ptr_y      = y;
+        last_click = -1;
+        return r;
+    }
+
+    if (i == last_click && now_ms - last_click_ms < DOUBLE_CLICK_MS && !(keymod & (KEYMOD_SHIFT | KEYMOD_CTRL))) {
+        last_click = -1;
+        picked     = i;
+        return r | VIEW_OPEN;
+    }
+    last_click    = i;
+    last_click_ms = now_ms;
+
+    if (keymod & KEYMOD_SHIFT) {
+        extend(i);
+    } else if (keymod & KEYMOD_CTRL) {
+        items[i].chosen ^= 1;
+        picked = anchor = i;
+    } else if (items[i].chosen) {
+        picked = anchor = i;
+        let_go = 1;
+    } else {
+        pick(i);
+    }
+
+    if (items[i].chosen) {
+        held   = i;
+        moved  = 0;
+        from_x = at_x = x - origin_x();
+        from_y = at_y = y - origin_y();
+        ptr_x  = x;
+        ptr_y  = y;
+    }
+    return r;
+}
+
+int view_mouse(int x, int y, int left, uint8_t keymod, uint64_t now_ms) {
     int press = left && !was_left;
     was_left  = (uint8_t)left;
 
-    if (bar.total > bar.visible && held < 0) {
+    if (bar.total > bar.visible && held < 0 && !banding) {
         int r = ui_scrollbar_mouse(&bar, x, y, left);
         if (r & UI_TAKEN)
             return (r & UI_CHANGED) ? VIEW_REDRAW : 0;
     }
 
-    if (held >= 0) {
-        if (left) {
-            int dx = x - from_x, dy = y - from_y;
-            if (mode == VIEW_ICONS && !moved && dx * dx + dy * dy >= DRAG_START * DRAG_START)
-                moved = 1;
-            if (!moved)
-                return 0;
-            drag_x = x - grab_x - grid_x();
-            drag_y = y - grab_y - grid_y();
+    if (banding) {
+        if (!left) {
+            banding = 0;
             return VIEW_REDRAW;
         }
+        edge_scroll(y);
+        ptr_x = x;
+        ptr_y = y;
+        choose_band();
+        return VIEW_REDRAW | VIEW_STATUS;
+    }
 
-        int r = 0;
-        if (moved) {
-            snap(held);
-            r = VIEW_REDRAW;
-        }
-        held  = -1;
-        moved = 0;
-        return r;
+    if (held >= 0) {
+        if (!left)
+            return let_go_of(x, y);
+
+        int dx = x - ptr_x, dy = y - ptr_y;
+        if (!moved && dx * dx + dy * dy >= DRAG_START * DRAG_START)
+            moved = 1;
+        if (!moved)
+            return 0;
+        if (ui_rect_contains(inner, x, y))
+            edge_scroll(y);
+        at_x   = x - origin_x();
+        at_y   = y - origin_y();
+        target = drop_target(x, y);
+        ptr_x  = x;
+        ptr_y  = y;
+        return VIEW_REDRAW | VIEW_STATUS;
     }
 
     if (!press || !ui_rect_contains(inner, x, y))
@@ -815,26 +1172,7 @@ int view_mouse(int x, int y, int left, uint64_t now_ms) {
         return 0;
     }
 
-    int i = item_at(x, y);
-    int r = pick(i);
-
-    if (i >= 0 && i == last_click && now_ms - last_click_ms < DOUBLE_CLICK_MS) {
-        last_click = -1;
-        return r | VIEW_OPEN;
-    }
-    last_click    = i;
-    last_click_ms = now_ms;
-
-    if (i >= 0) {
-        ui_rect_t cell = cell_rect(i);
-        held   = i;
-        moved  = 0;
-        from_x = x;
-        from_y = y;
-        grab_x = x - cell.x;
-        grab_y = y - cell.y;
-    }
-    return r | VIEW_REDRAW;
+    return press_on(item_at(x, y), x, y, keymod, now_ms);
 }
 
 int view_wheel(int notches) {
@@ -921,7 +1259,7 @@ static int edit_key(uint16_t keycode, char ch) {
     return 0;
 }
 
-int view_key(uint16_t keycode, char ch) {
+int view_key(uint16_t keycode, char ch, uint8_t keymod) {
     if (editing)
         return edit_key(keycode, ch);
     if (!count && keycode != KEY_BACK && keycode != F5)
@@ -929,18 +1267,24 @@ int view_key(uint16_t keycode, char ch) {
 
     int icons = mode == VIEW_ICONS;
     int page  = bar.visible > 1 ? bar.visible - 1 : 1;
+    int to    = -2;
     switch (keycode) {
-    case ArrowUp:    return pick(icons ? neighbour(0, -1) : (picked > 0 ? picked - 1 : 0));
-    case ArrowDown:  return pick(icons ? neighbour(0, 1) : (picked + 1 < count ? picked + 1 : count - 1));
-    case ArrowLeft:  return icons ? pick(neighbour(-1, 0)) : 0;
-    case ArrowRight: return icons ? pick(neighbour(1, 0)) : 0;
-    case PageUp:     return icons ? 0 : pick(picked - page > 0 ? picked - page : 0);
-    case PageDown:   return icons ? 0 : pick(picked + page < count ? picked + page : count - 1);
-    case Home:       return pick(icons ? first_in_grid() : 0);
-    case End:        return pick(count - 1);
+    case ArrowUp:    to = icons ? neighbour(0, -1) : (picked > 0 ? picked - 1 : 0); break;
+    case ArrowDown:  to = icons ? neighbour(0, 1) : (picked + 1 < count ? picked + 1 : count - 1); break;
+    case ArrowLeft:  to = icons ? neighbour(-1, 0) : -2; break;
+    case ArrowRight: to = icons ? neighbour(1, 0) : -2; break;
+    case PageUp:     to = icons ? -2 : (picked - page > 0 ? picked - page : 0); break;
+    case PageDown:   to = icons ? -2 : (picked + page < count ? picked + page : count - 1); break;
+    case Home:       to = icons ? first_in_grid() : 0; break;
+    case End:        to = count - 1; break;
     case KEY_ENTER:  return picked >= 0 ? VIEW_OPEN : 0;
     case KEY_BACK:   return VIEW_UP;
-    case KEY_DELETE: return picked >= 0 ? VIEW_DELETE : 0;
+    case KEY_DELETE: return view_chosen_count() ? VIEW_DELETE : 0;
+    case KEY_ESCAPE:
+        if (!view_chosen_count())
+            return 0;
+        unchoose();
+        return VIEW_REDRAW | VIEW_STATUS;
     case F2:
         view_rename_start();
         return VIEW_REDRAW;
@@ -948,6 +1292,10 @@ int view_key(uint16_t keycode, char ch) {
         view_refresh();
         return VIEW_REDRAW | VIEW_STATUS;
     }
+    if (to != -2)
+        return (keymod & KEYMOD_SHIFT) ? extend(to) : pick(to);
+    if (keymod & (KEYMOD_CTRL | KEYMOD_ALT))
+        return 0;
     if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
         return jump_to(ch);
     return 0;
@@ -956,6 +1304,7 @@ int view_key(uint16_t keycode, char ch) {
 void view_rename_start(void) {
     if (picked < 0)
         return;
+    pick(picked);
     editing    = 1;
     edit_fresh = 1;
     strcpy(edit, items[picked].name);

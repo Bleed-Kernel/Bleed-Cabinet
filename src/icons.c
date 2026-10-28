@@ -165,11 +165,31 @@ const ui_image_t *icon_for(const char *path, int kind, int px) {
     return &kinds[kind][px <= ICON_SMALL];
 }
 
-void icon_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y, int picked) {
+static void ghost_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y) {
+    ui_rect_t r = ui_rect_clip((ui_rect_t){x, y, img->w, img->h}, c->clip);
+    for (int row = r.y; row < r.y + r.h; row++) {
+        const uint32_t *src = img->pixels + (size_t)(row - y) * img->w + (r.x - x);
+        uint32_t       *dst = c->pixels + (size_t)row * c->pitch + r.x;
+        for (int col = 0; col < r.w; col++) {
+            uint32_t s = src[col], d = dst[col];
+            uint32_t a = (s >> 24) / 2;
+            uint32_t red = (((s >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * (255 - a)) / 255;
+            uint32_t grn = (((s >> 8) & 0xFF) * a + ((d >> 8) & 0xFF) * (255 - a)) / 255;
+            uint32_t blu = ((s & 0xFF) * a + (d & 0xFF) * (255 - a)) / 255;
+            dst[col] = red << 16 | grn << 8 | blu;
+        }
+    }
+}
+
+void icon_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y, int look) {
     if (!img || !img->pixels)
         return;
+    if (look == LOOK_GHOST) {
+        ghost_draw(c, img, x, y);
+        return;
+    }
     ui_image_draw(c, img, x, y);
-    if (!picked)
+    if (look != LOOK_PICKED)
         return;
 
     ui_rect_t r = ui_rect_clip((ui_rect_t){x, y, img->w, img->h}, c->clip);

@@ -34,6 +34,9 @@ typedef struct {
     int               kind;
     uint64_t          size;
     int               col, row;     // its grid cell in the icon view, -1 until its placed
+    uint8_t           chosen;       // part of the selection
+    uint8_t           cut;          // on the clipboard to be moved, drawn faded
+    uint8_t           kept;         // chosen before a ctrl drag box started, it stays chosen
     const ui_image_t *big;
     const ui_image_t *small;
 } entry_t;
@@ -61,8 +64,14 @@ enum {
 
 const ui_image_t *glyph(int which);
 
-// drawn over whatevers there, picked ones go dark oxblood like 9x washed them blue
-void icon_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y, int picked);
+enum {
+    LOOK_PLAIN,
+    LOOK_PICKED,
+    LOOK_GHOST,
+};
+
+// drawn over whatevers there
+void icon_draw(ui_canvas_t *c, const ui_image_t *img, int x, int y, int look);
 
 // the drive pictures on the home page, 32px
 enum {
@@ -87,6 +96,8 @@ enum {
 #define VIEW_UP         (1 << 3)    // backspace, go to the folder above
 #define VIEW_DELETE     (1 << 4)
 #define VIEW_RENAMED    (1 << 5)    // view_rename_name has the new name, the old one is still picked
+#define VIEW_DROP       (1 << 6)    // the chosen ones were dragged onto view_drop_target
+#define VIEW_DROP_OUT   (1 << 7)    // or let go outside the view, at view_drop_point
 
 // reads path in, -1 if its not a folder that can be read and nothing changes
 int  view_open(const char *path);
@@ -102,18 +113,50 @@ int  view_get_mode(void);
 
 int  view_count(void);
 const entry_t *view_entry(int i);
+
+// the one with the focus, -1 for none. its usually chosen but ctrl click can unchoose it
 int  view_picked(void);
+
+// only i chosen, -1 for nothing
 void view_pick(int i);
+void view_pick_all(void);
+
+// the focus moves to i
+void view_focus(int i);
+int  view_chosen_count(void);
+
+// full paths of everything chosen
+char **view_chosen_paths(int *n);
+
+// adds name to whats chosen
+void view_choose_name(const char *name);
+
+// a drag is going, and what its over that would take it. -1 for nothing
+int  view_dragging(void);
+int  view_drop_target(void);
+void view_drop_point(int *x, int *y);
+
+// reads the clipboard again to see whats been cut
+void view_mark_cut(void);
+
+// puts the icons back in rows in order
+void view_line_up(void);
+
+// the folder changed under us
+int  view_poll(void);
 
 // whats under x y, -1 for empty space. -2 if its not in the list at all
 int  view_at(int x, int y);
 void view_pick_name(const char *name);
 void view_entry_path(int i, char *out, size_t size);
 
+// what the type column says, File Folder, PNG Image..
+void kind_name(const entry_t *e, char *out, size_t size);
+
 void view_draw(ui_canvas_t *c);
-int  view_mouse(int x, int y, int left, uint64_t now_ms);
+int  view_mouse(int x, int y, int left, uint8_t keymod, uint64_t now_ms);
 int  view_wheel(int notches);
-int  view_key(uint16_t keycode, char ch);
+int  view_key(uint16_t keycode, char ch, uint8_t keymod);
 
 // naming in place: the picked entrys label turns into a box to type in
 void view_rename_start(void);
@@ -150,6 +193,36 @@ int  home_key(uint16_t keycode);
 // drives come and go and fill up, nonzero if it needs drawing again
 int  home_poll(void);
 
-// main.c
+// ops.c, copying moving and deleting with a progress box, and the clipboard
+
+#define CLIP_FILE   "/tmp/.cabinet-clip"
+#define DROP_FILE   "/tmp/.cabinet-drop"
+#define DROP_HEAD   "cabinet"
+
+enum {
+    OP_COPY,
+    OP_MOVE,
+};
+
+// paths into dir, asking before anything is replaced
+int  ops_transfer(char **paths, int n, const char *dir, int op);
+const char *ops_made(int i);
+
+// files and folders with everything in them, how many went
+int  ops_delete(char **paths, int n);
+int  ops_remove(const char *p);
+
+// bytes in p and everything under it, files and folders are counted if theyre not NULL
+uint64_t ops_measure(const char *p, int *files, int *folders);
+int  ops_same_drive(const char *a, const char *b);
+
+int    list_write(const char *file, const char *head, char **paths, int n);
+char **list_read(const char *file, char *head, size_t head_size, int *n);
+void   list_free(char **paths, int n);
+
+void   clip_set(char **paths, int n, int cut);
+char **clip_get(int *n, int *cut);
+void   clip_clear(void);
 
 void size_text(uint64_t size, char *out, size_t len);
+uint64_t now_ms(void);
