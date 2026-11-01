@@ -118,8 +118,28 @@ static const char *here(void) {
     return at_home ? HOME_PATH : view_path();
 }
 
+// the desktop reads win->pixels from another cpu whenever it likes.
+static uint32_t *frame;
+static size_t    frame_size;
+
 static ui_canvas_t canvas(void) {
-    return ui_canvas(win->pixels, win->width, win->height, win->pitch);
+    size_t size = (size_t)win->pitch * win->height * sizeof(uint32_t);
+    if (size > frame_size) {
+        uint32_t *bigger = realloc(frame, size);
+        if (!bigger)
+            return ui_canvas(win->pixels, win->width, win->height, win->pitch);
+        frame      = bigger;
+        frame_size = size;
+    }
+    return ui_canvas(frame, win->width, win->height, win->pitch);
+}
+
+static void canvas_show(const ui_canvas_t *c) {
+    if (c->pixels == win->pixels)
+        return;
+    for (int y = 0; y < win->height; y++)
+        memcpy(win->pixels + (size_t)y * win->pitch, c->pixels + (size_t)y * win->pitch,
+               (size_t)win->width * sizeof(uint32_t));
 }
 
 static void layout(void) {
@@ -284,6 +304,7 @@ static void draw_all(void) {
     // these go over everything else
     ui_dropdown_draw(&c, &view_list);
     ui_menu_draw(&c, &menu);
+    canvas_show(&c);
     cs_window_commit(win, 0, 0, win->width, win->height);
 }
 
