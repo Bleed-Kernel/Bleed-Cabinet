@@ -5,7 +5,7 @@
 #include <crime/crime.h>
 #include <cabinet.h>
 
-#define DESKTOP_PATH    "/initrd/bin/crime-scene"
+#define DESKTOP_PATH    "/bin/crime-scene"
 #define CACHE_MAX       128
 
 typedef struct {

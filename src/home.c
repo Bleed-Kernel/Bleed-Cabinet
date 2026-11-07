@@ -35,9 +35,9 @@ typedef struct {
 
 // shortcuts shown above the drives, the ones that arent there get left out
 static const char *const shortcuts[][2] = {
-    { "bin",     "/initrd/bin" },
-    { "lib",     "/initrd/lib" },
-    { "include", "/initrd/include" },
+    { "bin",     "/bin" },
+    { "lib",     "/lib" },
+    { "include", "/usr/include" },
     { "dev",     "/dev" },
 };
 #define SHORTCUTS   (int)(sizeof(shortcuts) / sizeof(shortcuts[0]))

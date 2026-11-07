@@ -13,9 +13,9 @@
 #define COLOUR_PAGE      0xD8D8DC
 #define COLOUR_VIEW      UI_COLOUR_BACK_L
 
-#define PROGRAM_PLAYER   "/initrd/bin/playback"
-#define PROGRAM_EDITOR   "/initrd/bin/tvi"
-#define PROGRAM_VIEWER   "/initrd/bin/exhibit"
+#define PROGRAM_PLAYER   "/bin/playback"
+#define PROGRAM_EDITOR   "/bin/tvi"
+#define PROGRAM_VIEWER   "/bin/exhibit"
 
 // what a file is, picked from its name and failing that its first few bytes
 enum {
